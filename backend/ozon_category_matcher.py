@@ -6,9 +6,17 @@ from typing import Any
 
 BUCKETS: list[dict[str, Any]] = [
     {
+        "bucket": "scarves",
+        "category": "Scarves and shawls",
+        "keywords": ["围巾", "方巾", "丝巾", "披肩", "领巾", "scarf", "shawl"],
+        "ozon_phrases": ["платок", "шарф", "палантин"],
+        "ozon_terms": ["платок", "шарф", "палантин"],
+        "ozon_negative_terms": ["носовой", "гребень", "резинка", "заколка", "ободок"],
+    },
+    {
         "bucket": "fashion_accessories",
         "category": "Fashion accessories",
-        "keywords": ["头巾", "发带", "发箍", "围巾", "方巾", "腰带", "饰品", "项链", "earring", "scarf"],
+        "keywords": ["头巾", "发带", "发箍", "腰带", "饰品", "项链", "earring"],
         "ozon_phrases": ["аксессуары для волос", "для волос", "головной убор", "шарф", "платок"],
         "ozon_terms": ["accessories", "fashion accessories", "аксессуар", "бижутер"],
         "ozon_negative_terms": [
@@ -127,6 +135,26 @@ def match_ozon_category(source: dict[str, Any], candidates: list[dict[str, str]]
             "ozon_category_matched_by": "local_keywords:general",
         }
     bucket = next(item for item in BUCKETS if item["bucket"] == classified["bucket"])
+    source_text = _text(" ".join(str(source.get(key) or "") for key in ("title", "shop_name", "shopName", "category")))
+    if classified["bucket"] == "scarves" and candidates:
+        preferred_terms: list[str] = []
+        if any(term in source_text for term in ["方巾", "丝巾", "领巾", "платок"]):
+            preferred_terms = ["платок"]
+        elif any(term in source_text for term in ["围巾", "шарф"]):
+            preferred_terms = ["шарф"]
+        elif any(term in source_text for term in ["披肩", "палантин"]):
+            preferred_terms = ["палантин"]
+        for term in preferred_terms:
+            for candidate in candidates:
+                text = _text(" ".join(str(candidate.get(key) or "") for key in ("category", "searchText")))
+                if term in text and "носовой" not in text:
+                    return {
+                        "ozon_category": candidate["category"],
+                        "ozon_category_id": candidate["categoryId"],
+                        "ozon_type_id": candidate["typeId"],
+                        "ozon_category_confidence": min(0.95, classified["confidence"] + 0.25),
+                        "ozon_category_matched_by": f"ozon_tree:{classified['bucket']}:{term}",
+                    }
     best_candidate: dict[str, str] | None = None
     best_score = 0
     for candidate in candidates or []:

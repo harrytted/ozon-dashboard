@@ -5,7 +5,7 @@ import json
 import re
 import time
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 import httpx
 
@@ -52,6 +52,23 @@ def extract_offer_id(url: str) -> str:
     if match:
         return match.group(1)
     raise ValueError("无法从 1688 链接中识别商品 ID")
+
+
+def extract_sku_id(url: str) -> str:
+    parsed = urlparse(str(url or ""))
+    values = parse_qs(parsed.query)
+    for key in ["skuId", "sku_id", "skuid"]:
+        if values.get(key) and values[key][0]:
+            return str(values[key][0]).strip()
+    match = re.search(r"(?:skuId|sku_id|skuid)=(\d+)", str(url or ""), flags=re.I)
+    return match.group(1) if match else ""
+
+
+def canonical_offer_url(url: str) -> str:
+    offer_id = extract_offer_id(url)
+    sku_id = extract_sku_id(url)
+    query = f"?{urlencode({'skuId': sku_id})}" if sku_id else ""
+    return f"https://detail.1688.com/offer/{offer_id}.html{query}"
 
 
 def _clean_text(value: str) -> str:
@@ -171,6 +188,7 @@ def sellable_skus(skus: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
 
 def parse_product_html(url: str, page_html: str) -> dict[str, Any]:
     offer_id = extract_offer_id(url)
+    sku_id = extract_sku_id(url)
     title = _extract_title(page_html)
     images = _extract_images(page_html)
     skus = _extract_skus(page_html)
@@ -179,13 +197,13 @@ def parse_product_html(url: str, page_html: str) -> dict[str, Any]:
     shop_match = re.search(r'"(?:shopName|companyName|sellerName)"\s*:\s*"([^"]+)"', page_html)
     return {
         "offer_id": offer_id,
-        "url": url,
+        "url": canonical_offer_url(url),
         "title": title or f"1688 商品 {offer_id}",
         "shop_name": _clean_text(shop_match.group(1)) if shop_match else "",
         "price_min": min(prices) if prices else 0,
         "price_max": max(prices) if prices else 0,
         "images": images,
-        "skus": skus or [{"name": "默认规格", "price": min(prices) if prices else 0, "stock": 0}],
+        "skus": skus or [{"name": f"规格 {sku_id}" if sku_id else "默认规格", "price": min(prices) if prices else 0, "stock": 0, "skuId": sku_id}],
         "status": "parsed" if title else "needs_review",
         "error": "" if title else "页面信息不足，请人工补充标题、价格或规格",
     }
@@ -193,17 +211,18 @@ def parse_product_html(url: str, page_html: str) -> dict[str, Any]:
 
 def fallback_product_from_url(url: str) -> dict[str, Any]:
     offer_id = extract_offer_id(url)
+    sku_id = extract_sku_id(url)
     numeric_seed = int(offer_id[-4:]) if offer_id[-4:].isdigit() else int(time.time()) % 1000
     price = round(8 + (numeric_seed % 35) * 0.8, 2)
     return {
         "offer_id": offer_id,
-        "url": url,
-        "title": f"1688 商品 {offer_id}",
+        "url": canonical_offer_url(url),
+        "title": f"1688 商品 {offer_id}{('-' + sku_id) if sku_id else ''}",
         "shop_name": "",
         "price_min": price,
         "price_max": price,
         "images": [],
-        "skus": [{"name": "默认规格", "price": price, "stock": 0}],
+        "skus": [{"name": f"规格 {sku_id}" if sku_id else "默认规格", "price": price, "stock": 0, "skuId": sku_id}],
         "status": "parsed",
         "error": "未能访问 1688 页面，已按链接生成待复核商品源",
     }
@@ -212,7 +231,10 @@ def fallback_product_from_url(url: str) -> dict[str, Any]:
 def _candidate_offer_urls(url: str) -> list[str]:
     offer_id = extract_offer_id(url)
     candidates = [url]
+    sku_id = extract_sku_id(url)
     mobile_url = f"https://m.1688.com/offer/{offer_id}.html"
+    if sku_id:
+        mobile_url = f"{mobile_url}?{urlencode({'skuId': sku_id})}"
     if mobile_url not in candidates:
         candidates.append(mobile_url)
     return candidates
@@ -249,7 +271,7 @@ async def fetch_product_from_url(url: str) -> dict[str, Any]:
                     continue
                 parsed_product = parse_product_html(candidate_url, response.text)
                 if parsed_product["status"] == "parsed":
-                    parsed_product["url"] = url
+                    parsed_product["url"] = canonical_offer_url(url)
                     return parsed_product
                 last_error = parsed_product["error"]
         fallback = fallback_product_from_url(url)

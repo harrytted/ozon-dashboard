@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -195,10 +196,12 @@ def row_to_store(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def row_to_source(row: sqlite3.Row) -> dict[str, Any]:
+    sku_match = re.search(r"[?&](?:skuId|sku_id|skuid)=(\d+)", row["url"], flags=re.I)
     return {
         "id": row["id"],
         "url": row["url"],
         "offerId": row["offer_id"],
+        "skuId": sku_match.group(1) if sku_match else "",
         "title": row["title"],
         "shopName": row["shop_name"],
         "ozonCategory": row["ozon_category"],

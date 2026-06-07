@@ -376,11 +376,64 @@
     return match ? match[1] : '';
   }
 
+  function extract1688SkuId(url) {
+    const match = String(url || '').match(/[?&](?:skuId|sku_id|skuid)=(\d+)/i);
+    return match ? match[1] : '';
+  }
+
+  function canonical1688SourceKey(source) {
+    const url = String(source && source.url || '');
+    const offerId = source && source.offerId ? String(source.offerId) : extract1688OfferId(url);
+    const skuId = source && source.skuId ? String(source.skuId) : extract1688SkuId(url);
+    const variant = (url.match(/#(.+)$/) || [])[1] || '';
+    return `${offerId}:${skuId}:${variant}`;
+  }
+
   function parse1688Urls(text) {
     return String(text || '')
       .split(/\s+/)
       .map((part) => part.trim())
       .filter((part) => /^https?:\/\/[^ ]*1688\.com\/offer\/\d+\.html/.test(part));
+  }
+
+  function parseImageUrls(text) {
+    return String(text || '')
+      .split(/\s+/)
+      .map((part) => part.trim())
+      .filter((part) => /^https?:\/\/\S+$/i.test(part));
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ''));
+      reader.onerror = () => reject(new Error(`读取图片失败：${file.name}`));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function readLocalImageUploads(input) {
+    const files = Array.from(input && input.files ? input.files : []);
+    const allowed = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+    const uploads = [];
+    for (const file of files.slice(0, 8)) {
+      if (!allowed.has(file.type)) {
+        throw new Error(`图片格式不支持：${file.name}`);
+      }
+      if (file.size > 15 * 1024 * 1024) {
+        throw new Error(`图片超过 15MB：${file.name}`);
+      }
+      uploads.push({
+        name: file.name,
+        contentType: file.type,
+        dataUrl: await readFileAsDataUrl(file)
+      });
+    }
+    return uploads;
+  }
+
+  function isReal1688Source(source) {
+    return /^https?:\/\/[^ ]*1688\.com\/offer\/\d+\.html/.test(String(source && source.url || ''));
   }
 
   function hashSpec(spec) {
@@ -468,11 +521,14 @@
     next.alibabaSources = Array.isArray(next.alibabaSources) ? next.alibabaSources : [];
     sources.forEach((source, index) => {
       if (!source.url) return;
+      if (!isReal1688Source(source)) return;
       const offerId = source.offerId || extract1688OfferId(source.url);
+      const skuId = source.skuId || extract1688SkuId(source.url);
       const normalized = {
         id: source.id || `src-${Date.now ? Date.now() : next.alibabaSources.length}-${index}`,
         url: source.url,
         offerId,
+        skuId,
         title: source.title || `1688 商品 ${offerId}`,
         shopName: source.shopName || '',
         ozonCategory: source.ozonCategory || '',
@@ -488,7 +544,8 @@
         error: source.error || '',
         createdAt: source.createdAt || next.today || TODAY
       };
-      const existingIndex = next.alibabaSources.findIndex((item) => item.url === normalized.url || item.id === normalized.id);
+      const sourceKey = canonical1688SourceKey(normalized);
+      const existingIndex = next.alibabaSources.findIndex((item) => item.id === normalized.id || canonical1688SourceKey(item) === sourceKey);
       if (existingIndex >= 0) {
         next.alibabaSources[existingIndex] = { ...next.alibabaSources[existingIndex], ...normalized };
       } else {
@@ -575,9 +632,8 @@
     const next = cloneState(state);
     next.products = Array.isArray(next.products) ? next.products : [];
     products.forEach((product) => {
-      if (next.products.some((item) => item.id === product.id)) return;
       const source = (next.alibabaSources || []).find((item) => item.id === product.sourceId) || {};
-      next.products.push({
+      const normalized = {
         id: product.id,
         storeId: 'all',
         sourceId: product.sourceId,
@@ -600,7 +656,13 @@
         status: product.validationStatus === 'ready' ? 'ready' : 'needs_review',
         validationStatus: product.validationStatus,
         validationErrors: product.validationErrors || []
-      });
+      };
+      const existingIndex = next.products.findIndex((item) => item.id === product.id);
+      if (existingIndex >= 0) {
+        next.products[existingIndex] = { ...next.products[existingIndex], ...normalized };
+      } else {
+        next.products.push(normalized);
+      }
     });
     return next;
   }
@@ -829,6 +891,44 @@
     return next;
   }
 
+  function updatePublishedProductName(state, storeId, offerId, name, record = {}) {
+    const next = cloneState(state);
+    const nextName = String(name || '').trim();
+    next.publishedProducts = (next.publishedProducts || []).map((item) => {
+      if (item.storeId === storeId && item.offerId === offerId) {
+        return {
+          ...item,
+          status: record.status || item.status,
+          importTaskId: record.importTaskId || item.importTaskId || '',
+          error: record.error || ''
+        };
+      }
+      return item;
+    });
+    const published = next.publishedProducts.find((item) => item.storeId === storeId && item.offerId === offerId);
+    if (published) {
+      next.products = (next.products || []).map((product) => {
+        if (product.id === published.productId) {
+          return { ...product, name: nextName, title: nextName, ruTitle: nextName };
+        }
+        return product;
+      });
+    }
+    return next;
+  }
+
+  function updateCatalogProductPrice(state, productId, priceCny) {
+    const next = cloneState(state);
+    const numericPrice = Number(priceCny || 0);
+    next.products = (next.products || []).map((product) => {
+      if (product.id === productId) {
+        return { ...product, price: numericPrice, suggestedPriceCny: numericPrice, suggestedPriceRub: numericPrice };
+      }
+      return product;
+    });
+    return next;
+  }
+
   function canUpdateProductPrice(product) {
     return Boolean(
       product
@@ -839,11 +939,12 @@
   }
 
   function canPublishProduct(product) {
+    const blockingErrors = productBlockingReviewErrors(product);
     return Boolean(
       product
       && product.storeId === 'all'
       && product.sourceId
-      && product.validationStatus === 'ready'
+      && (product.validationStatus === 'ready' || !blockingErrors.length)
     );
   }
 
@@ -851,8 +952,33 @@
     return Boolean(product && product.storeId === 'all' && product.sourceId);
   }
 
-  function productReviewMessage(product) {
+  function sourceForProduct(product) {
+    if (!product) return {};
+    const sources = state.alibabaSources || [];
+    return sources.find((source) => source.id === product.sourceId)
+      || sources.find((source) => source.offerId && source.offerId === product.sourceOfferId)
+      || {};
+  }
+
+  function catalogProductImageCount(product) {
+    const source = sourceForProduct(product);
+    const productImages = product && product.attributes && Array.isArray(product.attributes.bundle_images)
+      ? product.attributes.bundle_images
+      : [];
+    const sourceImages = Array.isArray(source.images) ? source.images : [];
+    return Math.max(productImages.length, sourceImages.length);
+  }
+
+  function productBlockingReviewErrors(product) {
     const errors = product && Array.isArray(product.validationErrors) ? product.validationErrors.filter(Boolean) : [];
+    return errors.filter((error) => {
+      const value = String(error || '');
+      return !value.includes('缺少商品图片') && !value.includes('Ozon 会隐藏无图商品');
+    });
+  }
+
+  function productReviewMessage(product) {
+    const errors = productBlockingReviewErrors(product);
     if (errors.length) return errors.join('；');
     return '商品需要先补齐 Ozon 类目、Type ID 或必填属性后才能上架';
   }
@@ -912,6 +1038,20 @@
     next.promotions = (next.promotions || []).filter((promotion) => promotion.storeId !== storeId);
     next.publishedProducts = (next.publishedProducts || []).filter((item) => item.storeId !== storeId);
     next.products = (next.products || []).filter((product) => product.storeId !== storeId && !publishedProductIds.has(product.id));
+    return next;
+  }
+
+  function updateOzonStoreName(state, storeId, name) {
+    const next = cloneState(state);
+    const nextName = String(name || '').trim();
+    next.stores = (next.stores || []).map((store) => {
+      if (store.id === storeId) return { ...store, name: nextName };
+      return store;
+    });
+    next.tasks = (next.tasks || []).map((task) => {
+      if (task.storeId === storeId) return { ...task, storeName: nextName };
+      return task;
+    });
     return next;
   }
 
@@ -1000,7 +1140,8 @@
     const labels = {
       ozon_bind: '绑定店铺',
       ozon_bind_bulk: '批量绑定',
-      ozon_products_sync: '同步商品'
+      ozon_products_sync: '同步商品',
+      ozon_product_publish: '发布商品'
     };
     return labels[kind] || kind || '任务';
   }
@@ -1123,6 +1264,38 @@
       return true;
     } catch (error) {
       if (!silent) showToast(error.message || '读取店铺商品失败');
+      return false;
+    }
+  }
+
+  async function refresh1688Sources(silent = false) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/1688/sources`);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '读取 1688 采集商品失败');
+      state.alibabaSources = (state.alibabaSources || []).filter((source) => isReal1688Source(source));
+      state = add1688Sources(state, result.sources || []);
+      saveState();
+      render();
+      return true;
+    } catch (error) {
+      if (!silent) showToast(error.message || '读取 1688 采集商品失败');
+      return false;
+    }
+  }
+
+  async function refreshProducts(silent = false) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/products`);
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || '读取通用商品库失败');
+      state.products = (state.products || []).filter((product) => !String(product.sourceUrl || '').startsWith('ozon://'));
+      state = addNormalizedProducts(state, result.products || []);
+      saveState();
+      render();
+      return true;
+    } catch (error) {
+      if (!silent) showToast(error.message || '读取通用商品库失败');
       return false;
     }
   }
@@ -1327,6 +1500,7 @@
       publish: {
         submitted: ['已提交', 'info'],
         processing: ['执行中', 'warning'],
+        needs_images: ['待补图', 'warning'],
         done: ['已完成', 'success'],
         synced: ['已同步', 'success'],
         failed: ['失败', 'danger'],
@@ -1603,6 +1777,7 @@
                 <td>
                   <button class="link-button" data-action="sync-store-products" data-store-id="${store.id}">${task ? '同步中' : '同步商品'}</button>
                   <button class="link-button" data-action="set-scope" data-scope="${store.id}" data-tab="store-products">查看商品</button>
+                  <button class="link-button" data-action="open-store-name-modal" data-store-id="${store.id}">改名</button>
                   <button class="link-button danger-link" data-action="delete-store" data-store-id="${store.id}">删除</button>
                 </td>
               </tr>
@@ -1616,6 +1791,7 @@
   function scopedSources() {
     const query = ui.query.trim().toLowerCase();
     return (state.alibabaSources || []).filter((source) => {
+      if (!isReal1688Source(source)) return false;
       return !query || [source.title, source.offerId, source.url, source.shopName, source.ozonCategory]
         .some((value) => String(value || '').toLowerCase().includes(query));
     });
@@ -1655,6 +1831,7 @@
           <div class="controls">
             <button class="secondary-button" data-action="rematch-ozon-categories">同步 Ozon 类目</button>
             <button class="secondary-button" data-action="normalize-sources">生成 SKU/定价</button>
+            <button class="secondary-button" data-action="open-modal" data-modal="1688-bundle">生成套装</button>
             <button class="primary-button" data-action="open-modal" data-modal="1688-import">导入 1688 URL</button>
           </div>
         </div>
@@ -1683,8 +1860,12 @@
             ${sources.map((source) => `
               <tr>
                 <td><input type="checkbox" data-action="select-source" data-id="${source.id}" ${ui.selectedSources.has(source.id) ? 'checked' : ''}></td>
-                <td><strong>${escapeHtml(source.title)}</strong><br><small>${escapeHtml(source.shopName || '未识别店铺')}</small></td>
-                <td>${escapeHtml(source.offerId)}</td>
+                <td>
+                  <strong>${escapeHtml(source.title)}</strong><br>
+                  <small>${escapeHtml(source.shopName || '未识别店铺')} · 图片 ${Array.isArray(source.images) ? source.images.length : 0} 张</small>
+                  ${source.error ? `<br><small class="error-text">${escapeHtml(source.error)}</small>` : ''}
+                </td>
+                <td>${escapeHtml(source.offerId)}${source.skuId ? `<br><small>SKU ${escapeHtml(source.skuId)}</small>` : ''}${(source.url.match(/#(.+)$/) || [])[1] ? `<br><small>${escapeHtml((source.url.match(/#(.+)$/) || [])[1])}</small>` : ''}</td>
                 <td>
                   <strong>${escapeHtml(source.ozonCategory || '未匹配')}</strong><br>
                   <small>ID ${escapeHtml(source.ozonCategoryId || '0')} / Type ${escapeHtml(source.ozonTypeId || '0')}</small>
@@ -1692,7 +1873,11 @@
                 <td>¥${Number(source.priceMin || 0).toFixed(2)}-${Number(source.priceMax || source.priceMin || 0).toFixed(2)}</td>
                 <td>${source.status === 'parsed' ? statusLabel('stock', 'on_sale') : statusLabel('store', 'warning')}</td>
                 <td><a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">1688链接</a></td>
-                <td><button class="link-button danger-link" data-action="delete-1688-source" data-source-id="${escapeHtml(source.id)}">删除</button></td>
+                <td>
+                  <button class="link-button" data-action="edit-1688-source" data-source-id="${escapeHtml(source.id)}">编辑</button>
+                  <button class="link-button" data-action="refresh-1688-images" data-source-id="${escapeHtml(source.id)}">采图</button>
+                  <button class="link-button danger-link" data-action="delete-1688-source" data-source-id="${escapeHtml(source.id)}">删除</button>
+                </td>
               </tr>
             `).join('')}
           </tbody>
@@ -1776,7 +1961,11 @@
                   <td>${recordPriceCny(record) ? currency(recordPriceCny(record)) : '-'}</td>
                   <td>${statusLabel('publish', record.status)}</td>
                   <td>${record.sourceUrl ? `<a href="${escapeHtml(record.sourceUrl)}" target="_blank" rel="noreferrer">查看</a>` : '<span class="muted-text">未绑定</span>'}</td>
-                  <td><button class="link-button" data-action="open-price-modal" data-store-id="${record.storeId}" data-offer-id="${escapeHtml(record.offerId)}">改价</button></td>
+                  <td>
+                    <button class="link-button" data-action="sync-publish-images" data-job-id="${escapeHtml(record.id)}">补图</button>
+                    <button class="link-button" data-action="sync-publish-attributes" data-job-id="${escapeHtml(record.id)}">补特征</button>
+                    <button class="link-button" data-action="open-price-modal" data-store-id="${record.storeId}" data-offer-id="${escapeHtml(record.offerId)}">改价</button>
+                  </td>
                 </tr>
               `;
             }).join('')}
@@ -1942,10 +2131,12 @@
             </tr>
           </thead>
           <tbody>
-            ${products.map((product) => `
+            ${products.map((product) => {
+              const imageCount = isCatalog ? catalogProductImageCount(product) : 0;
+              return `
               <tr class="${product.stock <= product.lowStockThreshold ? 'row-warning' : ''}">
                 <td><input type="checkbox" data-action="select-product" data-id="${product.id}" ${ui.selectedProducts.has(product.id) ? 'checked' : ''}></td>
-                <td><strong>${product.name}</strong></td>
+                <td><strong>${product.name}</strong>${isCatalog ? `<br><small>图片 ${imageCount} 张${imageCount ? '' : ' · 可先上架后补图'}</small>` : ''}</td>
                 <td>${isCatalog ? `<a href="${escapeHtml(product.sourceUrl || '#')}" target="_blank" rel="noreferrer">1688链接</a>` : getStoreName(product.storeId)}</td>
                 <td>${escapeHtml(product.sku || '-')}</td>
                 <td>${escapeHtml(product.category || '-')}</td>
@@ -1954,13 +2145,18 @@
                 <td>${isCatalog ? escapeHtml(product.sourceOfferId || '-') : product.sales}</td>
                 <td>${statusLabel('stock', product.status)}</td>
                 <td>
+                  ${isCatalog ? `<button class="link-button" data-action="open-catalog-price-modal" data-product-id="${escapeHtml(product.id)}">改价</button>` : ''}
+                  ${isCatalog ? `<button class="link-button" data-action="open-catalog-image-modal" data-product-id="${escapeHtml(product.id)}">补图</button>` : ''}
+                  ${isCatalog ? `<button class="link-button" data-action="refresh-catalog-images" data-product-id="${escapeHtml(product.id)}">采图</button>` : ''}
                   ${!isCatalog && canUpdateProductPrice(product) ? `<button class="link-button" data-action="open-price-modal" data-store-id="${product.storeId}" data-offer-id="${escapeHtml(product.sourceOfferId)}">改价</button>` : ''}
+                  ${!isCatalog && canUpdateProductPrice(product) ? `<button class="link-button" data-action="open-name-modal" data-store-id="${product.storeId}" data-offer-id="${escapeHtml(product.sourceOfferId)}">改名</button>` : ''}
                   ${canShowPublishEntry(product) ? `<button class="link-button" data-action="open-publish-product" data-product-id="${escapeHtml(product.id)}">上架</button>` : ''}
-                  ${!canUpdateProductPrice(product) && !canShowPublishEntry(product) ? '<span class="muted-text">未上架</span>' : ''}
+                  ${!isCatalog && !canUpdateProductPrice(product) && !canShowPublishEntry(product) ? '<span class="muted-text">未上架</span>' : ''}
                   <button class="link-button danger-link" data-action="delete-product" data-store-id="${product.storeId}" data-offer-id="${escapeHtml(product.sourceOfferId || '')}" data-product-id="${escapeHtml(product.id)}">删除</button>
                 </td>
               </tr>
-            `).join('')}
+            `;
+            }).join('')}
           </tbody>
         </table>
       </div>
@@ -2009,8 +2205,12 @@
       promotion: '新增促销活动',
       'ozon-bulk': '批量绑定 Ozon 店铺',
       '1688-import': '导入 1688 商品',
+      '1688-bundle': '生成 1688 套装商品',
+      '1688-source': '编辑 1688 商品',
       publish: '批量发布到 Ozon',
-      price: '修改 Ozon 价格',
+      price: '修改价格',
+      name: '修改商品名称',
+      'store-name': '修改店铺名称',
       order: '订单详情'
     };
     return `
@@ -2035,6 +2235,16 @@
           <label>Client ID<input name="clientId" required inputmode="numeric" autocomplete="off" placeholder="Ozon Seller Client ID"></label>
           <label>API Key<input name="apiKey" required type="password" autocomplete="off" placeholder="Ozon Seller API Key"></label>
           <button class="primary-button wide" type="submit">验证并绑定 Ozon 店铺</button>
+        </form>
+      `;
+    }
+    if (ui.modal.type === 'store-name') {
+      const store = state.stores.find((item) => item.id === ui.modal.storeId) || {};
+      return `
+        <form data-form="store-name" class="form-grid">
+          <p class="form-note">仅修改本系统里显示的店铺名称，不会修改 Ozon Seller 后台店铺资料。</p>
+          <label>店铺名称<input name="name" required maxlength="120" value="${escapeHtml(store.name || '')}" placeholder="例如：Ozon 莫斯科家居店"></label>
+          <button class="primary-button wide" type="submit">保存店铺名称</button>
         </form>
       `;
     }
@@ -2071,6 +2281,49 @@
         </form>
       `;
     }
+    if (ui.modal.type === '1688-bundle') {
+      const selectedSources = (state.alibabaSources || []).filter((source) => ui.selectedSources.has(source.id));
+      const sourceLines = selectedSources.length
+        ? selectedSources.map((source) => `<li>${escapeHtml(source.title)} · ¥${Number(source.priceMin || 0).toFixed(2)}</li>`).join('')
+        : '<li>请先在 1688 采集箱勾选要组合的商品源</li>';
+      return `
+        <form data-form="1688-bundle" class="form-grid">
+          <p class="form-note">把已勾选的 1688 商品源合并为一个 Ozon 套装商品；默认按 40% 目标净利生成建议价。</p>
+          <ul class="form-note">${sourceLines}</ul>
+          <label>套装中文名<input name="bundleName" required value="方巾 3 件套" placeholder="例如：民族风方巾 3 件套"></label>
+          <label>俄语标题<input name="ruTitle" required value="Набор женских платков 3 шт" placeholder="Набор женских платков 3 шт"></label>
+          <label>套装件数<input name="piecesCount" type="number" min="1" step="1" required value="${Math.max(3, selectedSources.length || 3)}"></label>
+          <label>目标净利率<input name="targetMargin" type="number" min="0.1" max="0.7" step="0.01" required value="0.4"></label>
+          <label>国内运费/采买摊销 CNY<input name="domesticShippingCny" type="number" min="0" step="0.01" required value="1.5"></label>
+          <label>包装贴标 CNY<input name="packagingCny" type="number" min="0" step="0.01" required value="1"></label>
+          <label>仓库操作 CNY<input name="warehouseHandlingCny" type="number" min="0" step="0.01" required value="1"></label>
+          <label>跨境物流 CNY<input name="crossBorderShippingCny" type="number" min="0" step="0.01" required value="18"></label>
+          <label>缓冲 CNY<input name="bufferCny" type="number" min="0" step="0.01" required value="1"></label>
+          <button class="primary-button wide" type="submit">生成套装 SKU/定价</button>
+        </form>
+      `;
+    }
+    if (ui.modal.type === '1688-source') {
+      const source = (state.alibabaSources || []).find((item) => item.id === ui.modal.sourceId) || {};
+      return `
+        <form data-form="1688-source" class="form-grid">
+          <p class="form-note">1688 风控或页面结构变化时，采集器可能只能识别价格。可在这里人工补齐商品名称和图片；图片链接支持没有 jpg/png 后缀的 CDN 地址。</p>
+          <input name="sourceId" type="hidden" value="${escapeHtml(source.id || '')}">
+          <label>1688 商品名称<input name="title" required value="${escapeHtml(source.title || '')}" placeholder="例如：围巾女2025春新款韩版复古拼色涂鸦大方巾"></label>
+          <label>店铺名<input name="shopName" value="${escapeHtml(source.shopName || '')}" placeholder="可选"></label>
+          <label>最低采购价 CNY<input name="priceMin" type="number" min="0" step="0.01" value="${Number(source.priceMin || 0).toFixed(2)}"></label>
+          <label>最高采购价 CNY<input name="priceMax" type="number" min="0" step="0.01" value="${Number(source.priceMax || source.priceMin || 0).toFixed(2)}"></label>
+          <label>商品图片链接
+            <textarea name="images" rows="6" placeholder="一行一个图片链接，例如 https://cbu01.alicdn.com/img/...">${escapeHtml((source.images || []).join('\n'))}</textarea>
+          </label>
+          <label>本地上传图片
+            <input name="localImages" type="file" accept="image/jpeg,image/png,image/webp" multiple>
+            <small>支持 jpg/png/webp，单张不超过 15MB；会上传到 OSS 后写入商品图片。</small>
+          </label>
+          <button class="primary-button wide" type="submit">保存 1688 商品信息</button>
+        </form>
+      `;
+    }
     if (ui.modal.type === 'publish') {
       const products = publishableProducts();
       const selectedProductIds = new Set(ui.modal.productIds && ui.modal.productIds.length ? ui.modal.productIds : products.map((product) => product.id));
@@ -2095,16 +2348,33 @@
       `;
     }
     if (ui.modal.type === 'price') {
-      const record = (state.publishedProducts || []).find((item) => item.storeId === ui.modal.storeId && item.offerId === ui.modal.offerId) || {};
-      const product = state.products.find((item) => item.id === record.productId) || {};
+      const isCatalogPrice = Boolean(ui.modal.productId);
+      const product = isCatalogPrice
+        ? (state.products.find((item) => item.id === ui.modal.productId) || {})
+        : (state.products.find((item) => item.id === ((state.publishedProducts || []).find((item) => item.storeId === ui.modal.storeId && item.offerId === ui.modal.offerId) || {}).productId) || {});
+      const record = isCatalogPrice
+        ? {}
+        : ((state.publishedProducts || []).find((item) => item.storeId === ui.modal.storeId && item.offerId === ui.modal.offerId) || {});
       return `
         <form data-form="price" class="form-grid">
-          <p class="form-note">${escapeHtml(getStoreName(ui.modal.storeId))} · ${escapeHtml(product.name || record.offerId || '')}</p>
-          <label>Offer ID<input name="offerId" readonly value="${escapeHtml(ui.modal.offerId || '')}"></label>
+          <p class="form-note">${isCatalogPrice ? '通用商品库 · 上架前建议售价' : `${escapeHtml(getStoreName(ui.modal.storeId))} · Ozon 店铺售价`}</p>
+          <label>商品<input readonly value="${escapeHtml(product.name || record.title || record.offerId || '')}"></label>
+          ${isCatalogPrice ? '' : `<label>Offer ID<input name="offerId" readonly value="${escapeHtml(ui.modal.offerId || '')}"></label>`}
           <label>新售价 CNY<input name="priceCny" type="number" min="1" step="0.01" required value="${recordPriceCny(record) || productPriceCny(product)}"></label>
-          <label>划线价 CNY<input name="oldPriceCny" type="number" min="0" step="0.01" placeholder="可选，不填则不改"></label>
-          <label>最低价 CNY<input name="minPriceCny" type="number" min="0" step="0.01" placeholder="可选，不填则不改"></label>
-          <button class="primary-button wide" type="submit">提交改价</button>
+          ${isCatalogPrice ? '' : '<label>划线价 CNY<input name="oldPriceCny" type="number" min="0" step="0.01" placeholder="可选，不填则不改"></label>'}
+          ${isCatalogPrice ? '' : '<label>最低价 CNY<input name="minPriceCny" type="number" min="0" step="0.01" placeholder="可选，不填则不改"></label>'}
+          <button class="primary-button wide" type="submit">${isCatalogPrice ? '保存建议售价' : '提交改价'}</button>
+        </form>
+      `;
+    }
+    if (ui.modal.type === 'name') {
+      const product = state.products.find((item) => item.storeId === ui.modal.storeId && item.sourceOfferId === ui.modal.offerId) || {};
+      return `
+        <form data-form="name" class="form-grid">
+          <p class="form-note">${escapeHtml(getStoreName(ui.modal.storeId))} · Ozon 商品名称会重新提交审核</p>
+          <label>Offer ID<input name="offerId" readonly value="${escapeHtml(ui.modal.offerId || '')}"></label>
+          <label>商品名称<input name="name" required maxlength="500" value="${escapeHtml(product.name || product.ruTitle || '')}" placeholder="请输入新的俄语商品标题"></label>
+          <button class="primary-button wide" type="submit">提交改名</button>
         </form>
       `;
     }
@@ -2216,6 +2486,14 @@
         ui.publishedPage = 1;
         await refreshPublishJobs(false, true);
       }
+      if (ui.tab === 'import') {
+        await refresh1688Sources(true);
+        return;
+      }
+      if (ui.tab === 'catalog') {
+        await refreshProducts(true);
+        return;
+      }
       if ((ui.tab === 'store-products' || ui.tab === 'inventory') && ui.scope !== 'all') {
         await loadStoreProducts(ui.scope, true);
       } else {
@@ -2246,6 +2524,55 @@
       ui.modal = { type: 'price', storeId: target.dataset.storeId, offerId: target.dataset.offerId };
       render();
     }
+    if (action === 'open-name-modal') {
+      const product = state.products.find((item) => item.storeId === target.dataset.storeId && item.sourceOfferId === target.dataset.offerId);
+      if (!canUpdateProductPrice(product)) return showToast('商品未上架到具体店铺，不能改名');
+      ui.modal = { type: 'name', storeId: target.dataset.storeId, offerId: target.dataset.offerId };
+      render();
+    }
+    if (action === 'open-catalog-price-modal') {
+      const productId = target.dataset.productId || '';
+      const product = state.products.find((item) => item.id === productId);
+      if (!product || product.storeId !== 'all') return showToast('只能修改通用商品库里的建议售价');
+      ui.modal = { type: 'price', productId };
+      render();
+    }
+    if (action === 'open-catalog-image-modal') {
+      const productId = target.dataset.productId || '';
+      const product = state.products.find((item) => item.id === productId);
+      if (!product || product.storeId !== 'all') return showToast('只能给通用商品库商品补图');
+      if (!product.sourceId) return showToast('该商品缺少 1688 来源，不能补图');
+      const source = sourceForProduct(product);
+      if (!source.id) {
+        await refresh1688Sources(true);
+      }
+      const refreshedProduct = state.products.find((item) => item.id === productId) || product;
+      const refreshedSource = sourceForProduct(refreshedProduct);
+      if (!refreshedSource.id) return showToast('未找到对应 1688 来源，请先在 1688 采集箱补齐');
+      ui.modal = { type: '1688-source', sourceId: refreshedSource.id };
+      render();
+    }
+    if (action === 'refresh-catalog-images') {
+      const productId = target.dataset.productId || '';
+      const product = state.products.find((item) => item.id === productId);
+      if (!product || product.storeId !== 'all') return showToast('只能给通用商品库商品采图');
+      if (!product.sourceId) return showToast('该商品缺少 1688 来源，不能采图');
+      const source = sourceForProduct(product);
+      const sourceId = source.id || product.sourceId;
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/1688/sources/${encodeURIComponent(sourceId)}/images/refresh`, {
+          method: 'POST'
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '采集图片失败');
+        state = add1688Sources(state, result.source ? [result.source] : []);
+        saveState();
+        render();
+        showToast(`已同步 ${result.source && result.source.images ? result.source.images.length : 0} 张图片`);
+      } catch (error) {
+        showToast(error.message || '采集图片失败');
+      }
+    }
     if (action === 'open-publish-product') {
       const productId = target.dataset.productId || '';
       const product = state.products.find((item) => item.id === productId);
@@ -2258,6 +2585,13 @@
     }
     if (action === 'sync-store-products') {
       await syncStoreProducts(target.dataset.storeId);
+    }
+    if (action === 'open-store-name-modal') {
+      const storeId = target.dataset.storeId || '';
+      const store = state.stores.find((item) => item.id === storeId);
+      if (!store) return showToast('店铺不存在');
+      ui.modal = { type: 'store-name', storeId };
+      render();
     }
     if (action === 'delete-store') {
       const storeId = target.dataset.storeId;
@@ -2294,6 +2628,26 @@
         showToast('商品已删除');
       } catch (error) {
         showToast(error.message || '删除商品失败');
+      }
+    }
+    if (action === 'edit-1688-source') {
+      ui.modal = { type: '1688-source', sourceId: target.dataset.sourceId };
+      render();
+    }
+    if (action === 'refresh-1688-images') {
+      const sourceId = target.dataset.sourceId || '';
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/1688/sources/${encodeURIComponent(sourceId)}/images/refresh`, {
+          method: 'POST'
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '采集图片失败');
+        state = add1688Sources(state, result.source ? [result.source] : []);
+        saveState();
+        render();
+        showToast(`已同步 ${result.source && result.source.images ? result.source.images.length : 0} 张图片`);
+      } catch (error) {
+        showToast(error.message || '采集图片失败');
       }
     }
     if (action === 'delete-1688-source') {
@@ -2339,6 +2693,36 @@
     }
     if (action === 'sync-publish-jobs') {
       await refreshPublishJobs(true);
+    }
+    if (action === 'sync-publish-images') {
+      const jobId = target.dataset.jobId || '';
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/products/publish-jobs/${encodeURIComponent(jobId)}/images/sync`, {
+          method: 'POST'
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '补图失败');
+        await refreshPublishJobs(false, true);
+        showToast('Ozon 商品图片已补传');
+      } catch (error) {
+        await refreshPublishJobs(false, true);
+        showToast(error.message || '补图失败');
+      }
+    }
+    if (action === 'sync-publish-attributes') {
+      const jobId = target.dataset.jobId || '';
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/products/publish-jobs/${encodeURIComponent(jobId)}/attributes/sync`, {
+          method: 'POST'
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '补特征失败');
+        await refreshPublishJobs(false, true);
+        showToast('Ozon 商品特征已提交');
+      } catch (error) {
+        await refreshPublishJobs(false, true);
+        showToast(error.message || '补特征失败');
+      }
     }
     if (action === 'normalize-sources') {
       if (!ui.selectedSources.size) return showToast('请先选择 1688 商品源');
@@ -2466,6 +2850,25 @@
         showToast(error.message || '请使用 node server.js 启动本地代理后再绑定');
       }
     }
+    if (form.dataset.form === 'store-name') {
+      const name = String(data.name || '').trim();
+      if (!name) return showToast('请填写店铺名称');
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/ozon/stores/${ui.modal.storeId}/name`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '修改店铺名称失败');
+        state = updateOzonStoreName(state, ui.modal.storeId, (result.store && result.store.name) || name);
+        ui.modal = null;
+        saveState();
+        showToast('店铺名称已更新');
+      } catch (error) {
+        showToast(error.message || '修改店铺名称失败');
+      }
+    }
     if (form.dataset.form === 'ship') {
       state = shipOrders(state, Array.from(ui.selectedOrders), data.carrier, data.trackingNo);
       ui.selectedOrders.clear();
@@ -2521,6 +2924,67 @@
       saveState();
       showToast(`已导入 ${urls.length} 个 1688 链接`);
     }
+    if (form.dataset.form === '1688-source') {
+      const sourceId = String(data.sourceId || '').trim();
+      if (!sourceId) return showToast('缺少 1688 商品源 ID');
+      try {
+        const uploadedImages = await readLocalImageUploads(form.querySelector('input[name="localImages"]'));
+        const response = await fetch(`${API_BASE_URL}/api/1688/sources/${encodeURIComponent(sourceId)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: data.title,
+            shopName: data.shopName,
+            priceMin: Number(data.priceMin || 0),
+            priceMax: Number(data.priceMax || data.priceMin || 0),
+            images: parseImageUrls(data.images || ''),
+            uploadedImages
+          })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '保存 1688 商品信息失败');
+        state = add1688Sources(state, result.source ? [result.source] : []);
+        ui.modal = null;
+        saveState();
+        await refreshProducts(true);
+        showToast('1688 商品信息已保存');
+      } catch (error) {
+        showToast(error.message || '保存 1688 商品信息失败');
+      }
+    }
+    if (form.dataset.form === '1688-bundle') {
+      const sourceIds = Array.from(ui.selectedSources);
+      if (!sourceIds.length) return showToast('请先选择 1688 商品源');
+      try {
+        const payload = {
+          sourceIds,
+          bundleName: data.bundleName,
+          ruTitle: data.ruTitle,
+          piecesCount: Number(data.piecesCount || sourceIds.length || 1),
+          targetMargin: Number(data.targetMargin || 0.4),
+          domesticShippingCny: Number(data.domesticShippingCny || 0),
+          packagingCny: Number(data.packagingCny || 0),
+          warehouseHandlingCny: Number(data.warehouseHandlingCny || 0),
+          crossBorderShippingCny: Number(data.crossBorderShippingCny || 0),
+          bufferCny: Number(data.bufferCny || 0)
+        };
+        const response = await fetch(`${API_BASE_URL}/api/products/bundle`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '生成套装失败');
+        state = addNormalizedProducts(state, result.product ? [result.product] : []);
+        ui.selectedSources.clear();
+        ui.tab = 'catalog';
+        ui.modal = null;
+        saveState();
+        showToast('已生成套装商品，请复核图片、类目和价格后发布');
+      } catch (error) {
+        showToast(error.message || '生成套装失败');
+      }
+    }
     if (form.dataset.form === 'publish') {
       const formData = new FormData(form);
       const productIds = formData.getAll('productIds');
@@ -2534,6 +2998,11 @@
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || '批量发布失败');
+        if (result.task) {
+          mergeTasks([result.task]);
+          ui.tasksHydrated = true;
+          ui.taskDrawerOpen = true;
+        }
         const published = (result.results || []).map((item) => {
           const product = state.products.find((candidate) => candidate.id === item.productId) || {};
           return {
@@ -2572,14 +3041,22 @@
       if (data.oldPriceCny) payload.oldPriceCny = Number(data.oldPriceCny);
       if (data.minPriceCny) payload.minPriceCny = Number(data.minPriceCny);
       try {
-        const response = await fetch(`${API_BASE_URL}/api/stores/${ui.modal.storeId}/products/${encodeURIComponent(ui.modal.offerId)}/price`, {
+        const isCatalogPrice = Boolean(ui.modal.productId);
+        const endpoint = isCatalogPrice
+          ? `${API_BASE_URL}/api/products/${encodeURIComponent(ui.modal.productId)}/price`
+          : `${API_BASE_URL}/api/stores/${ui.modal.storeId}/products/${encodeURIComponent(ui.modal.offerId)}/price`;
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || '改价失败');
-        state = updatePublishedProductPrice(state, ui.modal.storeId, ui.modal.offerId, result.product.priceCny ?? result.product.priceRub);
+        if (isCatalogPrice) {
+          state = updateCatalogProductPrice(state, ui.modal.productId, result.product.suggestedPriceCny ?? result.product.suggestedPriceRub);
+        } else {
+          state = updatePublishedProductPrice(state, ui.modal.storeId, ui.modal.offerId, result.product.priceCny ?? result.product.priceRub);
+        }
         ui.modal = null;
         saveState();
         showToast('价格已更新');
@@ -2587,12 +3064,65 @@
         showToast(error.message || '改价失败');
       }
     }
+    if (form.dataset.form === 'name') {
+      const name = String(data.name || '').trim();
+      if (!name) return showToast('请填写商品名称');
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/stores/${ui.modal.storeId}/products/${encodeURIComponent(ui.modal.offerId)}/name`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || '改名失败');
+        state = updatePublishedProductName(state, ui.modal.storeId, ui.modal.offerId, name, result.product || {});
+        ui.modal = null;
+        saveState();
+        showToast(result.importTaskId ? '改名任务已提交，可在上架记录同步状态' : '商品名称已更新');
+      } catch (error) {
+        showToast(error.message || '改名失败');
+      }
+    }
     if (form.dataset.form === 'inventory') {
-      state = adjustInventory(state, Array.from(ui.selectedProducts), data.mode, Number(data.value));
-      ui.selectedProducts.clear();
-      ui.modal = null;
-      saveState();
-      showToast('库存已批量修改');
+      const productIds = Array.from(ui.selectedProducts);
+      if (!productIds.length) return showToast('请先选择要修改库存的商品');
+      const targets = productIds.map((productId) => {
+        const product = (state.products || []).find((item) => item.id === productId) || {};
+        return {
+          productId,
+          storeId: product.storeId || '',
+          offerId: product.sourceOfferId || product.sku || ''
+        };
+      });
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/products/inventory`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            productIds,
+            targets,
+            mode: data.mode,
+            value: Number(data.value || 0)
+          })
+        });
+        const result = await response.json();
+        if (result.products && result.products.length) {
+          state = mergeSyncedStoreProducts(state, result.products);
+        }
+        if (!response.ok) {
+          const detail = result.failures && result.failures.length ? `：${result.failures[0].error}` : '';
+          throw new Error((result.error || '库存同步到 Ozon 失败') + detail);
+        }
+        ui.selectedProducts.clear();
+        ui.modal = null;
+        saveState();
+        render();
+        showToast(result.failed ? `库存部分同步成功，失败 ${result.failed} 个` : '库存已同步到 Ozon');
+      } catch (error) {
+        saveState();
+        render();
+        showToast(error.message || '库存同步到 Ozon 失败');
+      }
     }
     if (form.dataset.form === 'promotion') {
       const productIds = state.products.filter((product) => product.storeId === data.storeId).map((product) => product.id);
@@ -2607,6 +3137,8 @@
   document.addEventListener('DOMContentLoaded', () => {
     render();
     refreshBoundStores();
+    refresh1688Sources(true);
+    refreshProducts(true);
     refreshTasks(true);
   });
   document.addEventListener('click', handleClick);

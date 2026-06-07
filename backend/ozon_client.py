@@ -105,7 +105,29 @@ async def list_description_category_tree(client_id: str, api_key: str) -> dict[s
 
 
 OZON_PRICE_CURRENCY = "CNY"
+OZON_BRAND_ATTRIBUTE_ID = 31
+OZON_TYPE_ATTRIBUTE_ID = 8229
 OZON_MODEL_NAME_ATTRIBUTE_ID = 9048
+OZON_GENDER_ATTRIBUTE_ID = 9163
+OZON_MERGE_CARD_ATTRIBUTE_ID = 8292
+OZON_COLOR_ATTRIBUTE_ID = 10096
+OZON_COLOR_NAME_ATTRIBUTE_ID = 10097
+OZON_MATERIAL_COMPOSITION_ATTRIBUTE_ID = 4604
+OZON_RUSSIAN_SIZE_ATTRIBUTE_ID = 4295
+OZON_CLOTHING_PACKAGING_TYPE_ATTRIBUTE_ID = 4300
+OZON_CARE_ATTRIBUTE_ID = 4655
+OZON_HASHTAGS_ATTRIBUTE_ID = 23171
+OZON_PACKAGE_QUANTITY_ATTRIBUTE_ID = 9661
+OZON_ACCESSORY_SET_CONTENT_ATTRIBUTE_ID = 22272
+OZON_COUNTRY_ATTRIBUTE_ID = 4389
+OZON_NO_BRAND_VALUE_ID = 126745801
+OZON_SCARF_TYPE_VALUE_ID = 93181
+OZON_GENDER_FEMALE_VALUE_ID = 22881
+OZON_COLOR_MULTICOLOR_VALUE_ID = 369939085
+OZON_RUSSIAN_SIZE_UNIVERSAL_VALUE_ID = 35646
+OZON_CLOTHING_PACKAGE_VALUE_ID = 44412
+OZON_ACCESSORY_SET_SCARF_VALUE_ID = 971419670
+OZON_COUNTRY_CHINA_VALUE_ID = 90296
 
 
 def product_model_name(product: dict[str, Any]) -> str:
@@ -114,19 +136,89 @@ def product_model_name(product: dict[str, Any]) -> str:
 
 def import_attributes(product: dict[str, Any]) -> list[dict[str, Any]]:
     attributes = list(product.get("ozonAttributes") or [])
-    has_model_name = any(
-        int(attribute.get("id") or attribute.get("attribute_id") or 0) == OZON_MODEL_NAME_ATTRIBUTE_ID
-        for attribute in attributes
-        if isinstance(attribute, dict)
-    )
-    if not has_model_name:
+
+    def has_attribute(attribute_id: int) -> bool:
+        return any(
+            int(attribute.get("id") or attribute.get("attribute_id") or 0) == attribute_id
+            for attribute in attributes
+            if isinstance(attribute, dict)
+        )
+
+    def add_dictionary_attribute(attribute_id: int, value_id: int, value: str) -> None:
+        if not has_attribute(attribute_id):
+            attributes.append({"id": attribute_id, "values": [{"dictionary_value_id": value_id, "value": value}]})
+
+    def add_text_attribute(attribute_id: int, value: str) -> None:
+        next_value = str(value or "").strip()
+        if next_value and not has_attribute(attribute_id):
+            attributes.append({"id": attribute_id, "values": [{"value": next_value}]})
+
+    if not has_attribute(OZON_MODEL_NAME_ATTRIBUTE_ID):
         attributes.append(
             {
                 "id": OZON_MODEL_NAME_ATTRIBUTE_ID,
                 "values": [{"value": product_model_name(product)}],
             }
         )
+    product_text = " ".join(
+        str(product.get(key) or "").lower()
+        for key in ("ruTitle", "title", "name", "category")
+    )
+    is_scarf = (
+        str(product.get("typeId") or "") == "93181"
+        or str(product.get("category") or "").lower() in {"платок", "шарф", "палантин"}
+        or any(marker in product_text for marker in ("платок", "шарф", "косынк"))
+    )
+    if is_scarf:
+        attributes_data = product.get("attributes") if isinstance(product.get("attributes"), dict) else {}
+        pieces_count = int(attributes_data.get("bundle_pieces") or 1)
+        add_dictionary_attribute(OZON_BRAND_ATTRIBUTE_ID, OZON_NO_BRAND_VALUE_ID, "Нет бренда")
+        add_dictionary_attribute(OZON_TYPE_ATTRIBUTE_ID, OZON_SCARF_TYPE_VALUE_ID, "Платок")
+        add_dictionary_attribute(OZON_GENDER_ATTRIBUTE_ID, OZON_GENDER_FEMALE_VALUE_ID, "Женский")
+        add_dictionary_attribute(OZON_COLOR_ATTRIBUTE_ID, OZON_COLOR_MULTICOLOR_VALUE_ID, "разноцветный")
+        add_text_attribute(OZON_COLOR_NAME_ATTRIBUTE_ID, "мультиколор")
+        add_dictionary_attribute(OZON_RUSSIAN_SIZE_ATTRIBUTE_ID, OZON_RUSSIAN_SIZE_UNIVERSAL_VALUE_ID, "универсальный")
+        add_text_attribute(OZON_MATERIAL_COMPOSITION_ATTRIBUTE_ID, "100% полиэстер")
+        add_dictionary_attribute(OZON_CLOTHING_PACKAGING_TYPE_ATTRIBUTE_ID, OZON_CLOTHING_PACKAGE_VALUE_ID, "Пакет")
+        add_text_attribute(OZON_PACKAGE_QUANTITY_ATTRIBUTE_ID, str(max(1, pieces_count)))
+        add_dictionary_attribute(OZON_ACCESSORY_SET_CONTENT_ATTRIBUTE_ID, OZON_ACCESSORY_SET_SCARF_VALUE_ID, "шейный платок")
+        add_text_attribute(
+            OZON_CARE_ATTRIBUTE_ID,
+            "Бережная ручная стирка при температуре до 30 градусов. Не отбеливать. Сушить в расправленном виде.",
+        )
+        add_text_attribute(OZON_HASHTAGS_ATTRIBUTE_ID, "#платок #женский_платок #аксессуар #винтаж")
+        add_dictionary_attribute(OZON_COUNTRY_ATTRIBUTE_ID, OZON_COUNTRY_CHINA_VALUE_ID, "Китай")
+    if is_scarf and not has_attribute(OZON_MERGE_CARD_ATTRIBUTE_ID):
+        attributes.append(
+            {
+                "id": OZON_MERGE_CARD_ATTRIBUTE_ID,
+                "values": [{"value": str(product.get("sku") or product.get("ruTitle") or product.get("title") or "unique-card")}],
+            }
+        )
     return attributes
+
+
+async def update_product_attributes(
+    client_id: str,
+    api_key: str,
+    *,
+    offer_id: str,
+    product: dict[str, Any],
+) -> dict[str, Any]:
+    next_offer_id = str(offer_id or "").strip()
+    if not next_offer_id:
+        raise ValueError("缺少 Ozon Offer ID")
+    attributes = import_attributes(product)
+    if not attributes:
+        raise ValueError("没有可同步的商品特征")
+    if str(api_key).startswith("key-") or str(api_key).startswith("demo"):
+        return {"task_id": f"demo-attrs-{int(time.time() * 1000)}"}
+    return await call_ozon(
+        client_id,
+        api_key,
+        "/v1/product/attributes/update",
+        {"items": [{"offer_id": next_offer_id, "attributes": attributes}]},
+    )
 
 
 def build_product_import_item(product: dict[str, Any], offer_id: str, price_cny: float, stock: int) -> dict[str, Any]:
@@ -188,6 +280,52 @@ async def submit_product_import(
         }
     item = build_product_import_item(product, offer_id, price_cny, stock)
     return await call_ozon(client_id, api_key, "/v3/product/import", {"items": [item]})
+
+
+async def update_product_name(
+    *,
+    client_id: str,
+    api_key: str,
+    product: dict[str, Any],
+    offer_id: str,
+    name: str,
+    price_cny: float,
+    stock: int,
+) -> dict[str, Any]:
+    next_product = {**product, "ruTitle": str(name or "").strip()}
+    if str(api_key).startswith("key-") or str(api_key).startswith("demo"):
+        return {
+            "result": {
+                "task_id": f"demo-name-{int(time.time() * 1000)}",
+                "status": "submitted",
+            }
+        }
+    item = build_product_import_item(next_product, offer_id, price_cny, stock)
+    return await call_ozon(client_id, api_key, "/v3/product/import", {"items": [item]})
+
+
+async def import_product_pictures(
+    client_id: str,
+    api_key: str,
+    *,
+    product_id: str,
+    images: list[str],
+) -> dict[str, Any]:
+    if str(api_key).startswith("key-") or str(api_key).startswith("demo"):
+        return {"result": {"pictures": [{"product_id": product_id, "images": images, "status": "imported"}]}}
+    if not str(product_id or "").strip():
+        raise ValueError("缺少 Ozon 商品 ID，无法补图")
+    if not images:
+        raise ValueError("缺少商品图片，无法补图")
+    payload = {
+        "pictures": [
+            {
+                "product_id": int(product_id) if str(product_id).isdigit() else product_id,
+                "images": images[:15],
+            }
+        ]
+    }
+    return await call_ozon(client_id, api_key, "/v1/product/pictures/import", payload)
 
 
 async def get_product_import_info(client_id: str, api_key: str, task_id: str) -> dict[str, Any]:
@@ -347,7 +485,45 @@ async def update_product_stocks(
     }
     if str(api_key).startswith("key-") or str(api_key).startswith("demo"):
         return {"result": [{**item, "updated": True, "errors": []}]}
-    return await call_ozon(client_id, api_key, "/v2/products/stocks", {"stocks": [item]})
+    response = await call_ozon(client_id, api_key, "/v2/products/stocks", {"stocks": [item]})
+    error = stock_update_error(response)
+    if error:
+        raise RuntimeError(error)
+    return response
+
+
+def stock_update_error(response: dict[str, Any]) -> str:
+    result = response.get("result") if isinstance(response, dict) else None
+    items = result if isinstance(result, list) else []
+    if isinstance(result, dict):
+        for key in ("items", "stocks"):
+            if isinstance(result.get(key), list):
+                items = result[key]
+                break
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        errors = item.get("errors") or item.get("error")
+        if not errors:
+            continue
+        if isinstance(errors, list):
+            return "；".join(
+                stock_error_message(error)
+                for error in errors
+                if error
+            )
+        return stock_error_message(errors)
+    return ""
+
+
+def stock_error_message(error: Any) -> str:
+    if not isinstance(error, dict):
+        return str(error)
+    code = str(error.get("code") or "").strip()
+    message = str(error.get("message") or "").strip()
+    if code == "PRODUCT_HAS_NOT_BEEN_TAGGED_YET" or "tags validation failed" in message.lower():
+        return "商品还未完成 Ozon 打标/审核，暂不能同步库存；请先同步上架状态，待商品有 Ozon Product ID 后再改库存"
+    return message or code or str(error)
 
 
 async def list_fbs_orders(client_id: str, api_key: str, since: str, to: str) -> dict[str, Any]:

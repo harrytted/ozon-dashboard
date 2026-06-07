@@ -32,6 +32,15 @@ class Rematch1688CategoriesRequest(BaseModel):
     sourceIds: list[str] = Field(default_factory=list)
 
 
+class Update1688SourceRequest(BaseModel):
+    title: str
+    shopName: str = ""
+    priceMin: float | None = None
+    priceMax: float | None = None
+    images: list[str] = Field(default_factory=list)
+    uploadedImages: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class NormalizeProductsRequest(BaseModel):
     sourceIds: list[str] = Field(default_factory=list)
     targetMargin: float = 0.30
@@ -47,10 +56,23 @@ class NormalizeProductsRequest(BaseModel):
     returnLossRate: float = 0.03
 
 
+class BundleProductsRequest(NormalizeProductsRequest):
+    bundleName: str = "方巾套装"
+    ruTitle: str = ""
+    piecesCount: int = 3
+
+
 class PublishProductsRequest(BaseModel):
     productIds: list[str] = Field(default_factory=list)
     storeIds: list[str] = Field(default_factory=list)
     stock: int = 10
+
+
+class UpdateInventoryRequest(BaseModel):
+    productIds: list[str] = Field(default_factory=list)
+    targets: list[dict[str, str]] = Field(default_factory=list)
+    mode: str = "set"
+    value: int = 0
 
 
 class UpdateProductPriceRequest(BaseModel):
@@ -60,6 +82,14 @@ class UpdateProductPriceRequest(BaseModel):
     priceRub: float | None = None
     oldPriceRub: float | None = None
     minPriceRub: float | None = None
+
+
+class UpdateProductNameRequest(BaseModel):
+    name: str
+
+
+class UpdateStoreNameRequest(BaseModel):
+    name: str
 
 
 class AiNormalizedProduct(BaseModel):
